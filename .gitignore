@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+sandboxes/
+host_stdout.log
+host_stderr.log
+.env
+*.log

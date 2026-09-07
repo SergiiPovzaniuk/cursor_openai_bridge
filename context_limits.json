@@ -1,0 +1,14 @@
+{
+  "default": 200000,
+  "composer-2.5": 300000,
+  "auto": 200000,
+  "auto-smart": 200000,
+  "gpt-5.6-luna-medium": 300000,
+  "gpt-5.6-sol-xhigh": 300000,
+  "claude-opus-5-thinking-high": 200000,
+  "claude-sonnet-5-thinking-high": 200000,
+  "cursor-grok-4.6-xhigh": 200000,
+  "glm-5.2-high": 128000,
+  "kimi-k2.7-code": 128000,
+  "kimi-k3-high": 128000
+}
