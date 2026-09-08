@@ -21,6 +21,17 @@ log = get_logger(__name__)
 
 TOOL_CALL_COALESCE_WINDOW_S = 0.015
 
+# The Cursor agent's actual local cwd is an internal sandbox folder on this host, not the
+# real project on whatever machine is executing the tool calls (e.g. a remote Continue PC).
+# Without this, the model reports/uses that sandbox path as its "current directory" when
+# constructing file paths, which is meaningless on the machine actually running the tools.
+NO_LOCAL_FS_NOTE = (
+    "You have no real local filesystem; file tools execute on the user's actual machine "
+    "via their editor. Ignore any apparent local working directory -- never build file "
+    "paths from it. Use paths relative to the project root, or exact paths already given "
+    "by the user or returned by prior tool results.\n\n"
+)
+
 
 def to_sdk_mode(business_mode: str) -> str:
     return "agent" if business_mode == "agent" else "plan"
@@ -102,6 +113,8 @@ async def run_turn(payload: dict, headers: dict, ctx: ChatContext) -> AsyncItera
 
     system = _system_prompt(messages)
     system_prefix = f"[System instructions]\n{system}\n[End of system instructions]\n\n" if system else ""
+    if openai_tools:
+        system_prefix = NO_LOCAL_FS_NOTE + system_prefix
 
     # A conv_header identifies one Continue chat 1:1; if a session already exists under it,
     # this is a continuation (or a retry/resubmit of an earlier turn) -- never fall through to
