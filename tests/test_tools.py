@@ -185,6 +185,39 @@ async def test_search_web_uses_remote_fetch_tool():
 
 
 @pytest.mark.asyncio
+async def test_edit_existing_file_uses_deterministic_remote_tools():
+    openai_tools = [
+        {"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "required": ["filepath"], "properties": {"filepath": {"type": "string"}}}}},
+        {"type": "function", "function": {"name": "edit_existing_file", "parameters": {"type": "object", "required": ["filepath", "changes"], "properties": {"filepath": {"type": "string"}, "changes": {"type": "string"}}}}},
+        {"type": "function", "function": {"name": "single_find_and_replace", "parameters": {"type": "object", "required": ["filepath", "old_string", "new_string"], "properties": {"filepath": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "replace_all": {"type": "boolean"}}}}},
+    ]
+    session = FakeSession()
+    custom_tools = build_custom_tools(openai_tools, {"session": session}, FakeRegistry())
+
+    class Ctx:
+        tool_call_id = "call_edit"
+
+    task = asyncio.create_task(custom_tools["edit_existing_file"].execute(
+        {"filepath": "probe.txt", "changes": "new content\n"}, Ctx()
+    ))
+    await asyncio.sleep(0.01)
+    read_call = session.emitted[0]["call"]
+    assert read_call["function"]["name"] == "read_file"
+    session.pending[read_call["id"]].set_result("old content\n")
+    await asyncio.sleep(0.01)
+    edit_call = session.emitted[1]["call"]
+    assert edit_call["function"]["name"] == "single_find_and_replace"
+    assert json.loads(edit_call["function"]["arguments"]) == {
+        "filepath": "probe.txt",
+        "old_string": "old content\n",
+        "new_string": "new content\n",
+        "replace_all": False,
+    }
+    session.pending[edit_call["id"]].set_result("edited")
+    assert await task == "edited"
+
+
+@pytest.mark.asyncio
 async def test_build_custom_tools_timeout_unregisters(monkeypatch):
     import host.tools as tools_mod
 

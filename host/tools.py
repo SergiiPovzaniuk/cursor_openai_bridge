@@ -85,10 +85,17 @@ def build_custom_tools(openai_tools: list[dict] | None, session_ref: dict[str, R
         if read_only and name not in READ_ONLY_TOOLS:
             continue
         remote_name = "fetch_url_content" if name == "search_web" and "fetch_url_content" in names else name
+        compatible_edit = name == "edit_existing_file" and {"read_file", "single_find_and_replace"} <= names
         out[name] = CustomTool(
-            description=fn.get("description") or "",
+            description=(
+                "Edit an existing file. The changes argument must contain the complete final file content without markdown fences or placeholders."
+                if compatible_edit else fn.get("description") or ""
+            ),
             input_schema=fn.get("parameters") or {"type": "object", "properties": {}},
-            execute=_make_execute(name, fn.get("parameters") or {}, session_ref, registry, remote_name),
+            execute=(
+                _make_compatible_edit(fn.get("parameters") or {}, session_ref, registry)
+                if compatible_edit else _make_execute(name, fn.get("parameters") or {}, session_ref, registry, remote_name)
+            ),
         )
     out["bridge_reply"] = CustomTool(
         description="Deliver the complete final response to the user after all other tools are complete.",
@@ -141,31 +148,61 @@ def _make_execute(name: str, schema: dict, session_ref: dict[str, RunSession], r
         session = session_ref["session"]
         ensure_remote_tool_args(args, session)
         call_id = context.tool_call_id or f"call_{uuid.uuid4().hex}"
-        future = session.register_pending(call_id, name)
-        registry.register_pending_call(session, call_id)
         remote_args = {"url": f"https://www.bing.com/search?q={quote_plus(args['query'])}"} if remote_name != name else args
-        tool_call = {
-            "id": call_id,
-            "type": "function",
-            "function": {"name": remote_name, "arguments": json.dumps(remote_args, ensure_ascii=False)},
-        }
-        log.info("tool_call proposed", extra={"call_id": call_id, "name": name, "args": args})
-        await session.emit({"type": "tool_call", "call": tool_call})
-        try:
-            result = await asyncio.wait_for(future, timeout=CONFIG.suspend_ttl_s)
-        except asyncio.TimeoutError:
-            log.error("tool_call timed out waiting for result", extra={"call_id": call_id, "name": name})
-            session.pending.pop(call_id, None)
-            registry.unregister_pending_call(call_id)
-            run_task = getattr(session, "run_task", None)
-            if run_task is not None and not run_task.done():
-                run_task.cancel()
-            raise
-        except BaseException:
-            session.pending.pop(call_id, None)
-            registry.unregister_pending_call(call_id)
-            raise
-        log.info("tool_call resolved", extra={"call_id": call_id, "name": name, "result_len": len(result) if isinstance(result, str) else -1})
-        return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        return await _call_remote(session, registry, remote_name, remote_args, call_id)
 
     return execute
+
+
+def _make_compatible_edit(schema: dict, session_ref: dict[str, RunSession], registry: Any):
+    async def execute(args: dict, context: CustomToolContext) -> str:
+        args = normalize_tool_args("edit_existing_file", args, schema)
+        session = session_ref["session"]
+        ensure_remote_tool_args(args, session)
+        base_id = context.tool_call_id or f"call_{uuid.uuid4().hex}"
+        current = await _call_remote(session, registry, "read_file", {"filepath": args["filepath"]}, f"{base_id}_read")
+        changes = args["changes"]
+        fenced = changes.strip()
+        if fenced.startswith("```") and fenced.endswith("```"):
+            changes = fenced.split("\n", 1)[1].rsplit("\n", 1)[0]
+        if current == changes:
+            return "File already has the requested content."
+        if not current:
+            raise ValueError("edit_existing_file cannot replace an empty file")
+        return await _call_remote(
+            session,
+            registry,
+            "single_find_and_replace",
+            {"filepath": args["filepath"], "old_string": current, "new_string": changes, "replace_all": False},
+            f"{base_id}_write",
+        )
+
+    return execute
+
+
+async def _call_remote(session: RunSession, registry: Any, name: str, args: dict, call_id: str) -> str:
+    future = session.register_pending(call_id, name)
+    registry.register_pending_call(session, call_id)
+    tool_call = {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+    }
+    log.info("tool_call proposed: %s", name)
+    await session.emit({"type": "tool_call", "call": tool_call})
+    try:
+        result = await asyncio.wait_for(future, timeout=CONFIG.suspend_ttl_s)
+    except asyncio.TimeoutError:
+        log.error("tool_call timed out waiting for result: %s", name)
+        session.pending.pop(call_id, None)
+        registry.unregister_pending_call(call_id)
+        run_task = getattr(session, "run_task", None)
+        if run_task is not None and not run_task.done():
+            run_task.cancel()
+        raise
+    except BaseException:
+        session.pending.pop(call_id, None)
+        registry.unregister_pending_call(call_id)
+        raise
+    log.info("tool_call resolved: %s", name)
+    return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
