@@ -1,6 +1,6 @@
 import pytest
 
-from host.session import RunSession, is_new_conversation, trailing_tool_messages, transcript_hash
+from host.session import RunSession, SessionRegistry, is_new_conversation, trailing_tool_messages, transcript_hash
 
 
 def test_is_new_conversation_true_for_single_user_message():
@@ -41,7 +41,8 @@ def test_transcript_hash_stable_and_order_sensitive():
 
 @pytest.mark.asyncio
 async def test_run_session_pending_lifecycle():
-    session = RunSession("conv-1", agent=None, cwd="/tmp/x", tools_signature="none")
+    session = RunSession("conv-1", agent=None, cwd="/tmp/x", tools_signature="none", remote_context="remote")
+    assert session.remote_context == "remote"
     fut = session.register_pending("call_1", "read_file")
     assert not fut.done()
     assert session.resolve_pending("call_1", "content")
@@ -56,3 +57,11 @@ async def test_run_session_cancel_all_pending():
     session.cancel_all_pending("closed")
     assert fut.done()
     assert isinstance(fut.exception(), TimeoutError)
+
+
+def test_completed_tool_call_lookup():
+    registry = SessionRegistry(None)
+    session = RunSession("conv-1", None, "/tmp/x", "sig")
+    registry._by_conv[session.conversation_id] = session
+    registry.mark_completed_call(session, "call-1")
+    assert registry.find_by_completed_tool_call("call-1") is session

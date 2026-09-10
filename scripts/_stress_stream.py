@@ -1,7 +1,8 @@
 import httpx
+import os
 
 BASE = "http://127.0.0.1:18080"
-TOKEN = "vNjo6ZDNQamYb2w98solftTvzoyM1vdZM5dQLIyhi4"
+TOKEN = os.getenv("BEARER_TOKEN", "continue-local")
 MSG = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. The quick brown fox jumps over the lazy dog. 42 is the answer to everything. Random hex: a7f3b1d8c9e2"
 
 payload = {

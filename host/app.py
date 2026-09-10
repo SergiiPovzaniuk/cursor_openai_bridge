@@ -33,8 +33,10 @@ chat_ctx: ChatContext | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global registry, models_cache, chat_ctx
+    CONFIG.validate()
     await RUNTIME.start()
     registry = SessionRegistry(RUNTIME)
+    RUNTIME.set_before_restart(registry.close_all)
     models_cache = ModelsCache(RUNTIME)
     chat_ctx = ChatContext(RUNTIME, registry, models_cache)
     await models_cache.ensure_fresh()
@@ -42,6 +44,7 @@ async def lifespan(app: FastAPI):
     log.info("bridge ready")
     yield
     await registry.stop_reaper()
+    await registry.close_all()
     await RUNTIME.stop()
 
 
@@ -53,8 +56,12 @@ if STATIC_DIR.exists():
 @app.middleware("http")
 async def limit_body_size(request: Request, call_next):
     cl = request.headers.get("content-length")
-    if cl is not None and int(cl) > CONFIG.max_body_bytes:
-        return JSONResponse(status_code=413, content={"error": {"message": "request body too large", "type": "invalid_request_error"}})
+    if cl is not None:
+        try:
+            if int(cl) > CONFIG.max_body_bytes:
+                return JSONResponse(status_code=413, content={"error": {"message": "request body too large", "type": "invalid_request_error"}})
+        except ValueError:
+            return JSONResponse(status_code=400, content={"error": {"message": "invalid content-length", "type": "invalid_request_error"}})
     return await call_next(request)
 
 

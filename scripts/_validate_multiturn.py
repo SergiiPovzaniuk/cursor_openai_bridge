@@ -7,9 +7,15 @@ import uuid
 import httpx
 
 BASE = "http://127.0.0.1:18080"
-TOKEN = "vNjo6ZDNQamYb2w98solftTvzoyM1vdZM5dQLIyhi4"
-H = {"Authorization": f"Bearer {TOKEN}", "X-Conversation-Id": f"conv-{uuid.uuid4().hex}"}
+TOKEN = os.getenv("BEARER_TOKEN", "continue-local")
 WORKDIR = os.path.join(os.environ["TEMP"], "relay_tool_validate")
+H = {
+    "Authorization": f"Bearer {TOKEN}",
+    "X-Conversation-Id": f"conv-{uuid.uuid4().hex}",
+    "X-Continue-Workspace": WORKDIR,
+    "X-Continue-OS": "windows",
+    "X-Continue-Shell": "powershell",
+}
 os.makedirs(WORKDIR, exist_ok=True)
 TARGET = os.path.join(WORKDIR, "call_me.txt")
 with open(TARGET, "w", encoding="utf-8") as f:

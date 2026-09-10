@@ -38,7 +38,9 @@ def check_rate_limit(request: Request) -> None:
 
 def require_bearer(authorization: str | None = Header(default=None)) -> None:
     if not CONFIG.bearer_token:
-        return
+        if CONFIG.dev_mode:
+            return
+        raise unauthorized("BEARER_TOKEN is not configured")
     expected = f"Bearer {CONFIG.bearer_token}"
     if authorization != expected:
         raise unauthorized()
@@ -53,5 +55,5 @@ def check_request(request: Request) -> None:
 
 def check_relay_token(token: str | None) -> bool:
     if not CONFIG.relay_token:
-        return True
+        return CONFIG.dev_mode
     return token == CONFIG.relay_token

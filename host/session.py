@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from cursor_sdk import AgentOptions, CursorAgentError, CustomTool, LocalAgentOptions, RateLimitError
 
 from .config import CONFIG
+from .errors import OpenAIError
 from .logging_setup import get_logger
 from .runtime import CursorRuntime
 
@@ -61,18 +64,22 @@ class OutputSink:
 
 
 class RunSession:
-    def __init__(self, conversation_id: str, agent: Any, cwd: str, tools_signature: str) -> None:
+    def __init__(self, conversation_id: str, agent: Any, cwd: str, tools_signature: str, remote_context: str = "", model: str = "") -> None:
         self.conversation_id = conversation_id
         self.agent = agent
         self.cwd = cwd
         self.tools_signature = tools_signature
+        self.remote_context = remote_context
+        self.model = model
         self.pending: dict[str, PendingCall] = {}
         self.sink: OutputSink | None = None
         self.turn_lock = asyncio.Lock()
         self.created_at = time.monotonic()
         self.last_active = time.monotonic()
         self.run_active = False
+        self.bridge_reply_sent = False
         self.run_task: asyncio.Task | None = None
+        self.active_request_hash = ""
         self.custom_tools: dict[str, CustomTool] = {}
 
     def touch(self) -> None:
@@ -108,6 +115,7 @@ class SessionRegistry:
         self._by_conv: dict[str, RunSession] = {}
         self._by_hash: dict[str, str] = {}
         self._by_pending_call: dict[str, str] = {}
+        self._by_completed_call: dict[str, str] = {}
         self._lock = asyncio.Lock()
         self._reap_task: asyncio.Task | None = None
 
@@ -118,10 +126,24 @@ class SessionRegistry:
         conv = self._by_pending_call.get(call_id)
         return self._by_conv.get(conv) if conv else None
 
+    def find_by_completed_tool_call(self, call_id: str) -> RunSession | None:
+        conv = self._by_completed_call.get(call_id)
+        return self._by_conv.get(conv) if conv else None
+
     def find_by_prior_transcript(self, messages_prefix: list[dict]) -> RunSession | None:
         h = transcript_hash(messages_prefix)
         conv = self._by_hash.get(h)
         return self._by_conv.get(conv) if conv else None
+
+    def has_active(self, tools_signature: str) -> bool:
+        return any(s.run_active and s.tools_signature == tools_signature for s in self._by_conv.values())
+
+    def find_active_request(self, messages: list[dict], tools_signature: str) -> RunSession | None:
+        request_hash = transcript_hash(messages)
+        return next(
+            (s for s in self._by_conv.values() if s.run_active and s.tools_signature == tools_signature and s.active_request_hash == request_hash),
+            None,
+        )
 
     def index_completed_turn(self, session: RunSession, full_transcript: list[dict]) -> None:
         self._by_hash[transcript_hash(full_transcript)] = session.conversation_id
@@ -132,8 +154,15 @@ class SessionRegistry:
     def unregister_pending_call(self, call_id: str) -> None:
         self._by_pending_call.pop(call_id, None)
 
-    async def create(self, *, model: str, sdk_mode: str, custom_tools: dict[str, CustomTool], conversation_id: str | None = None, tools_signature: str = "") -> RunSession:
+    def mark_completed_call(self, session: RunSession, call_id: str) -> None:
+        self._by_completed_call[call_id] = session.conversation_id
+        if len(self._by_completed_call) > 4096:
+            self._by_completed_call.pop(next(iter(self._by_completed_call)))
+
+    async def create(self, *, model: str, sdk_mode: str, custom_tools: dict[str, CustomTool], conversation_id: str | None = None, tools_signature: str = "", remote_context: str = "") -> RunSession:
         async with self._lock:
+            if conversation_id and conversation_id in self._by_conv:
+                await self.close(self._by_conv[conversation_id])
             if len(self._by_conv) >= CONFIG.agent_max_count:
                 await self._evict_oldest_locked()
             conv_id = conversation_id or f"conv-{uuid.uuid4().hex}"
@@ -146,9 +175,6 @@ class SessionRegistry:
                 if not cwd.exists():
                     break
             cwd.mkdir(parents=True, exist_ok=True)
-            # `tools` is an allowlist of built-in Cursor tools. Suppressing built-ins with
-            # tools=[] also disables the "mcp" gateway that custom_tools are served through,
-            # so keep "mcp" allowed whenever there are custom tools to expose.
             options = AgentOptions(
                 model=model,
                 api_key=CONFIG.cursor_api_key or None,
@@ -157,7 +183,7 @@ class SessionRegistry:
                 local=LocalAgentOptions(cwd=str(cwd), setting_sources=[], custom_tools=custom_tools or None),
             )
             agent = await self._create_agent_with_retry(options)
-            session = RunSession(conv_id, agent, str(cwd), tools_signature)
+            session = RunSession(conv_id, agent, str(cwd), tools_signature, remote_context, model)
             session.custom_tools = custom_tools
             self._by_conv[conv_id] = session
             log.info("session created", extra={"conversation_id": conv_id})
@@ -183,17 +209,31 @@ class SessionRegistry:
         self._by_conv.pop(session.conversation_id, None)
         for call_id in [k for k, v in self._by_pending_call.items() if v == session.conversation_id]:
             self._by_pending_call.pop(call_id, None)
+        for call_id in [k for k, v in self._by_completed_call.items() if v == session.conversation_id]:
+            self._by_completed_call.pop(call_id, None)
         for h in [k for k, v in self._by_hash.items() if v == session.conversation_id]:
             self._by_hash.pop(h, None)
         try:
             await session.agent.close()
         except Exception:
             log.warning("error closing agent", exc_info=True)
+        try:
+            cwd = Path(session.cwd).resolve()
+            cwd.relative_to(CONFIG.sandbox_root)
+            shutil.rmtree(cwd, ignore_errors=True)
+        except (ValueError, OSError):
+            pass
+
+    async def close_all(self) -> None:
+        await asyncio.gather(*(self.close(session) for session in list(self._by_conv.values())), return_exceptions=True)
 
     async def _evict_oldest_locked(self) -> None:
         if not self._by_conv:
             return
-        oldest = min(self._by_conv.values(), key=lambda s: s.last_active)
+        idle = [s for s in self._by_conv.values() if not s.run_active and not s.pending]
+        if not idle:
+            raise OpenAIError("All agent sessions are active", status=503, type_="server_error", code="agent_capacity")
+        oldest = min(idle, key=lambda s: s.last_active)
         await self.close(oldest)
 
     async def reap_idle(self) -> None:

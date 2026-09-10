@@ -8,6 +8,7 @@
 (function () {
   const state = { token: window.__cursorToken || "", conn: window.__cursorConnId || "default" };
   const BASE = (window.__cursorRelayUrl || (location.origin + "/relay")).replace(/\/$/, "");
+  let connected = false;
 
   function setStatus(s) {
     const el = document.getElementById("status");
@@ -27,30 +28,38 @@
   }
 
   function qs() {
-    return "?token=" + encodeURIComponent(state.token) + "&conn=" + encodeURIComponent(state.conn);
+    return "?conn=" + encodeURIComponent(state.conn);
   }
 
   async function pollLoop() {
     while (true) {
       try {
-        const res = await fetch(BASE + "/poll" + qs(), { cache: "no-store" });
+        const res = await fetch(BASE + "/poll" + qs(), {
+          cache: "no-store",
+          headers: { "X-Relay-Token": state.token },
+        });
         if (!res.ok) throw new Error("poll " + res.status);
         const body = await res.json();
         setStatus("connected");
+        if (!connected) deliver({ k: "hello" });
+        connected = true;
         for (const frame of body.frames || []) deliver(frame);
       } catch (e) {
+        if (connected) deliver({ k: "status", ready: false });
+        connected = false;
         setStatus("disconnected, retrying...");
         await new Promise((r) => setTimeout(r, 1000));
       }
     }
   }
 
-  window.__cursorTx = function (jsonStr) {
-    fetch(BASE + "/send" + qs(), {
+  window.__cursorTx = async function (jsonStr) {
+    const res = await fetch(BASE + "/send" + qs(), {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Relay-Token": state.token },
       body: jsonStr,
-    }).catch((e) => log("send failed: " + e));
+    });
+    if (!res.ok) throw new Error("send " + res.status);
     return true;
   };
 

@@ -1,33 +1,45 @@
-"""Validate our host against Continue IDE extension's REAL built-in agent-mode tool set
-(names/schemas per docs.continue.dev/ide-extensions/agent/how-it-works). Confirms every one
-of these 15 tools registers cleanly with the Cursor agent (no MCP name/schema rejection) and
-that a realistic read_file -> edit_existing_file flow round-trips tool names/args exactly."""
+"""Validate Continue VS Code 2.1.0 tools against the relay."""
 import json
 import os
 import uuid
 import httpx
 
 BASE = "http://127.0.0.1:18080"
-TOKEN = "vNjo6ZDNQamYb2w98solftTvzoyM1vdZM5dQLIyhi4"
-H = {"Authorization": f"Bearer {TOKEN}", "X-Conversation-Id": f"conv-{uuid.uuid4().hex}"}
+TOKEN = os.getenv("BEARER_TOKEN", "continue-local")
+H = {
+    "Authorization": f"Bearer {TOKEN}",
+    "X-Conversation-Id": f"conv-{uuid.uuid4().hex}",
+    "X-Continue-Workspace": os.path.join(os.environ["TEMP"], "relay_tool_validate"),
+    "X-Continue-OS": "windows",
+    "X-Continue-Shell": "powershell",
+}
 
-# Real Continue IDE-extension agent-mode built-in tools: name + representative schema.
 CONTINUE_TOOLS = [
     ("read_file", {"type": "object", "required": ["filepath"], "properties": {"filepath": {"type": "string"}}}),
+    ("read_file_range", {"type": "object", "required": ["filepath", "startLine", "endLine"], "properties": {"filepath": {"type": "string"}, "startLine": {"type": "number"}, "endLine": {"type": "number"}}}),
     ("read_currently_open_file", {"type": "object", "properties": {}}),
-    ("ls", {"type": "object", "properties": {"dirpath": {"type": "string"}, "recursive": {"type": "boolean"}}}),
-    ("glob_search", {"type": "object", "required": ["pattern"], "properties": {"pattern": {"type": "string"}}}),
+    ("ls", {"type": "object", "properties": {"dirPath": {"type": "string"}, "recursive": {"type": "boolean"}}}),
+    ("file_glob_search", {"type": "object", "required": ["pattern"], "properties": {"pattern": {"type": "string"}}}),
     ("grep_search", {"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}}),
     ("fetch_url_content", {"type": "object", "required": ["url"], "properties": {"url": {"type": "string"}}}),
     ("search_web", {"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}}),
     ("view_diff", {"type": "object", "properties": {}}),
     ("view_repo_map", {"type": "object", "properties": {}}),
     ("view_subdirectory", {"type": "object", "required": ["directory_path"], "properties": {"directory_path": {"type": "string"}}}),
-    ("codebase_tool", {"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}}),
+    ("codebase", {"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}}),
     ("create_new_file", {"type": "object", "required": ["filepath", "contents"], "properties": {"filepath": {"type": "string"}, "contents": {"type": "string"}}}),
     ("edit_existing_file", {"type": "object", "required": ["filepath", "changes"], "properties": {"filepath": {"type": "string"}, "changes": {"type": "string"}}}),
-    ("run_terminal_command", {"type": "object", "required": ["command"], "properties": {"command": {"type": "string"}}}),
-    ("create_rule_block", {"type": "object", "required": ["name", "rule"], "properties": {"name": {"type": "string"}, "rule": {"type": "string"}}}),
+    ("single_find_and_replace", {"type": "object", "required": ["filepath", "old_string", "new_string"], "properties": {"filepath": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "replace_all": {"type": "boolean"}}}),
+    ("multi_edit", {"type": "object", "required": ["filepath", "edits"], "properties": {
+        "filepath": {"type": "string"},
+        "edits": {"type": "array", "items": {"type": "object", "required": ["old_string", "new_string"], "properties": {
+            "old_string": {"type": "string"}, "new_string": {"type": "string"}, "replace_all": {"type": "boolean"}
+        }}},
+    }}),
+    ("run_terminal_command", {"type": "object", "required": ["command"], "properties": {"command": {"type": "string"}, "waitForCompletion": {"type": "boolean"}}}),
+    ("create_rule_block", {"type": "object", "required": ["name", "rule"], "properties": {"name": {"type": "string"}, "rule": {"type": "string"}, "description": {"type": "string"}, "globs": {"type": "string"}, "regex": {"type": "string"}, "alwaysApply": {"type": "boolean"}}}),
+    ("request_rule", {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}}),
+    ("read_skill", {"type": "object", "required": ["skillName"], "properties": {"skillName": {"type": "string"}}}),
 ]
 TOOLS = [{"type": "function", "function": {"name": n, "description": f"{n} tool", "parameters": s}} for n, s in CONTINUE_TOOLS]
 
@@ -71,13 +83,15 @@ for turn in range(6):
         if name == "read_file":
             with open(args["filepath"], encoding="utf-8") as f:
                 result = f.read()
-        elif name == "edit_existing_file":
+        elif name in {"edit_existing_file", "single_find_and_replace", "multi_edit"}:
             with open(TARGET, "w", encoding="utf-8") as f:
                 f.write("status = done\n")
             result = f"Successfully edited {TARGET}"
         else:
             result = "ok"
         messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+    if "read_file" in seen_names and seen_names & {"edit_existing_file", "single_find_and_replace", "multi_edit"}:
+        break
 else:
     raise AssertionError(f"did not converge -- tool names seen: {seen_names}")
 
@@ -86,4 +100,5 @@ with open(TARGET, encoding="utf-8") as f:
 assert "done" in final, final
 print("\ntool names used:", seen_names)
 assert "read_file" in seen_names, "model never called read_file"
-print(f"\nPASS: all {len(CONTINUE_TOOLS)} real Continue tool names registered with the agent; read_file + edit_existing_file round-tripped correctly.")
+assert seen_names & {"edit_existing_file", "single_find_and_replace", "multi_edit"}, "model never called an edit tool"
+print(f"\nPASS: Continue tool schemas registered; read_file and deterministic edit round-tripped correctly.")

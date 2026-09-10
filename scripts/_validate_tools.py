@@ -4,9 +4,14 @@ import os
 import httpx
 
 BASE = "http://127.0.0.1:18080"
-TOKEN = "vNjo6ZDNQamYb2w98solftTvzoyM1vdZM5dQLIyhi4"
-H = {"Authorization": f"Bearer {TOKEN}"}
+TOKEN = os.getenv("BEARER_TOKEN", "continue-local")
 WORKDIR = os.path.join(os.environ["TEMP"], "relay_tool_validate")
+H = {
+    "Authorization": f"Bearer {TOKEN}",
+    "X-Continue-Workspace": WORKDIR,
+    "X-Continue-OS": "windows",
+    "X-Continue-Shell": "powershell",
+}
 os.makedirs(WORKDIR, exist_ok=True)
 TARGET = os.path.join(WORKDIR, "hello.txt")
 CONTENT = "hello from tool validation test"

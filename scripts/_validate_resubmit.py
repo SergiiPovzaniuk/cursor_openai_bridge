@@ -7,7 +7,7 @@ import uuid
 import httpx
 
 BASE = "http://127.0.0.1:18080"
-TOKEN = "vNjo6ZDNQamYb2w98solftTvzoyM1vdZM5dQLIyhi4"
+TOKEN = os.getenv("BEARER_TOKEN", "continue-local")
 CONV_ID = f"conv-{uuid.uuid4().hex}"
 H = {"Authorization": f"Bearer {TOKEN}", "X-Conversation-Id": CONV_ID}
 WORKDIR = os.path.join(os.environ["TEMP"], "relay_tool_validate")

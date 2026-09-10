@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 
 from cursor_sdk import AsyncClient
 
@@ -18,6 +19,7 @@ class CursorRuntime:
         self._restart_task: asyncio.Task | None = None
         self._supervisor_task: asyncio.Task | None = None
         self._closing = False
+        self._before_restart: Callable[[], Awaitable[None]] | None = None
 
     @property
     def client(self) -> AsyncClient:
@@ -27,6 +29,9 @@ class CursorRuntime:
 
     def is_ready(self) -> bool:
         return self._ready.is_set()
+
+    def set_before_restart(self, callback: Callable[[], Awaitable[None]]) -> None:
+        self._before_restart = callback
 
     async def start(self) -> None:
         CONFIG.sandbox_root.mkdir(parents=True, exist_ok=True)
@@ -58,6 +63,8 @@ class CursorRuntime:
         await asyncio.wait_for(self._ready.wait(), timeout=timeout)
 
     async def restart(self) -> None:
+        if self._before_restart is not None:
+            await self._before_restart()
         async with self._lock:
             old = self._client
             self._client = None

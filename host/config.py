@@ -29,6 +29,7 @@ def _list(name: str) -> list[str]:
 
 @dataclass(frozen=True)
 class Config:
+    dev_mode: bool = field(default_factory=lambda: _bool("DEV_MODE", False))
     host: str = field(default_factory=lambda: os.environ.get("HOST", "0.0.0.0"))
     port: int = field(default_factory=lambda: _int("PORT", 8787))
     cursor_api_key: str = field(default_factory=lambda: os.environ.get("CURSOR_API_KEY", ""))
@@ -52,6 +53,19 @@ class Config:
     log_json: bool = field(default_factory=lambda: _bool("LOG_JSON", True))
     default_model: str = field(default_factory=lambda: os.environ.get("DEFAULT_MODEL", "composer-2.5"))
     replay_max_chars: int = field(default_factory=lambda: _int("REPLAY_MAX_CHARS", 32000))
+
+    def validate(self) -> None:
+        if self.bridge_mode != "suspend":
+            raise RuntimeError("BRIDGE_MODE must be suspend")
+        if self.dev_mode:
+            return
+        missing = [name for name, value in (
+            ("CURSOR_API_KEY", self.cursor_api_key),
+            ("BEARER_TOKEN", self.bearer_token),
+            ("RELAY_TOKEN", self.relay_token),
+        ) if not value]
+        if missing:
+            raise RuntimeError(f"Missing required configuration: {', '.join(missing)}")
 
     def load_context_limits(self) -> dict[str, int]:
         try:

@@ -5,6 +5,7 @@ from host import security
 
 
 class FakeConfig:
+    dev_mode = False
     bearer_token = "secret123"
     allowlist_ips = ()
     rate_limit_per_minute = 2
@@ -28,12 +29,24 @@ def test_require_bearer_rejects_missing(monkeypatch):
         security.require_bearer(None)
 
 
-def test_require_bearer_disabled_when_no_token(monkeypatch):
+def test_require_bearer_rejects_unconfigured_token(monkeypatch):
     class NoAuthConfig(FakeConfig):
         bearer_token = ""
 
     monkeypatch.setattr(security, "CONFIG", NoAuthConfig())
+    with pytest.raises(HTTPException):
+        security.require_bearer(None)
+
+
+def test_dev_mode_allows_empty_tokens(monkeypatch):
+    class DevConfig(FakeConfig):
+        bearer_token = ""
+        relay_token = ""
+        dev_mode = True
+
+    monkeypatch.setattr(security, "CONFIG", DevConfig())
     security.require_bearer(None)
+    assert security.check_relay_token(None)
 
 
 def test_check_relay_token(monkeypatch):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from typing import AsyncIterator
@@ -14,27 +15,26 @@ from .events import DoneEvent, ErrorEvent, Event, ReasoningEvent, TextEvent, Too
 from .logging_setup import get_logger
 from .models import ModelsCache
 from .runtime import CursorRuntime
-from .session import RunSession, SessionRegistry, is_new_conversation, trailing_tool_messages
+from .session import RunSession, SessionRegistry, is_new_conversation, trailing_tool_messages, transcript_hash
 from .tools import build_custom_tools, classify_mode, tools_signature
 
 log = get_logger(__name__)
 
-TOOL_CALL_COALESCE_WINDOW_S = 0.015
+TOOL_CALL_COALESCE_WINDOW_S = 0.35
 
 # The Cursor agent's actual local cwd is an internal sandbox folder on this host, not the
 # real project on whatever machine is executing the tool calls (e.g. a remote Continue PC).
 # Without this, the model reports/uses that sandbox path as its "current directory" when
 # constructing file paths, which is meaningless on the machine actually running the tools.
-NO_LOCAL_FS_NOTE = (
-    "You have no real local filesystem; file tools execute on the user's actual machine "
-    "via their editor. Ignore any apparent local working directory -- never build file "
-    "paths from it. Use paths relative to the project root, or exact paths already given "
-    "by the user or returned by prior tool results.\n\n"
-)
+REMOTE_HEADERS = {
+    "workspace": "x-continue-workspace",
+    "os": "x-continue-os",
+    "shell": "x-continue-shell",
+}
 
 
 def to_sdk_mode(business_mode: str) -> str:
-    return "agent" if business_mode == "agent" else "plan"
+    return "agent"
 
 
 def _content_text(content: object) -> str:
@@ -52,6 +52,24 @@ def _system_prompt(messages: list[dict]) -> str:
     return "\n".join(p for p in parts if p)
 
 
+def _remote_execution_context(headers: dict) -> str:
+    def value(name: str, fallback: str) -> str:
+        return str(headers.get(REMOTE_HEADERS[name]) or fallback).replace("\r", " ").replace("\n", " ")[:500]
+
+    workspace = value("workspace", "the workspace opened in Continue")
+    os_name = value("os", "the Continue client OS")
+    shell = value("shell", "the Continue client shell")
+    return (
+        "[Remote execution contract]\n"
+        "Inference runs on a separate privileged host, but every exposed tool executes in Continue on the restricted client PC.\n"
+        "The host cwd, host OS, host filesystem, and any sandbox path are implementation details: never mention or use them.\n"
+        f"Client workspace: {workspace}\nClient OS: {os_name}\nClient shell: {shell}\n"
+        "For filepath, dirPath, and directory_path arguments use paths relative to the client workspace unless the user or a client tool supplied an exact absolute path.\n"
+        "Generate terminal commands only for the client OS and shell. Treat client tool results as authoritative.\n"
+        "[End remote execution contract]\n\n"
+    )
+
+
 def _render_prior_transcript(messages: list[dict]) -> str:
     lines = []
     for m in messages:
@@ -59,6 +77,10 @@ def _render_prior_transcript(messages: list[dict]) -> str:
         if role == "system":
             continue
         text = _content_text(m.get("content"))
+        if role == "assistant" and m.get("tool_calls"):
+            text = json.dumps(m["tool_calls"], ensure_ascii=False)
+        elif role == "tool":
+            text = f"{m.get('tool_call_id')}: {text}"
         if not text:
             continue
         lines.append(f"{role}: {text}")
@@ -86,17 +108,38 @@ async def run_turn(payload: dict, headers: dict, ctx: ChatContext) -> AsyncItera
 
     tool_msgs = trailing_tool_messages(messages)
     resolved_session: RunSession | None = None
+    unmatched_tool_results = False
     if tool_msgs:
+        matches: list[tuple[dict, RunSession, bool]] = []
         for m in tool_msgs:
             call_id = m.get("tool_call_id")
             if not call_id:
-                continue
+                raise OpenAIError("tool_call_id is required", status=409, code="unknown_tool_call")
             session = ctx.registry.find_by_tool_call(call_id)
+            completed = False
             if session is None:
+                session = ctx.registry.find_by_completed_tool_call(call_id)
+                completed = session is not None
+                if completed and not session.run_active:
+                    session = None
+                    completed = False
+            if session is None:
+                unmatched_tool_results = True
+                log.warning("tool result arrived after its pending call expired", extra={"call_id": call_id})
                 continue
+            if resolved_session is not None and resolved_session is not session:
+                raise OpenAIError("Tool results belong to different conversations", status=409, code="tool_session_mismatch")
             resolved_session = session
-            session.resolve_pending(call_id, _content_text(m.get("content")))
+            matches.append((m, session, completed))
+        for m, session, completed in matches:
+            call_id = m["tool_call_id"]
+            if completed:
+                continue
+            log.info("tool result received, resolving pending call", extra={"call_id": call_id})
+            if not session.resolve_pending(call_id, _content_text(m.get("content"))):
+                continue
             ctx.registry.unregister_pending_call(call_id)
+            ctx.registry.mark_completed_call(session, call_id)
 
     if resolved_session is not None:
         async for ev in _attach_and_stream(resolved_session, ctx.registry, messages, already_running=True):
@@ -113,8 +156,7 @@ async def run_turn(payload: dict, headers: dict, ctx: ChatContext) -> AsyncItera
 
     system = _system_prompt(messages)
     system_prefix = f"[System instructions]\n{system}\n[End of system instructions]\n\n" if system else ""
-    if openai_tools:
-        system_prefix = NO_LOCAL_FS_NOTE + system_prefix
+    remote_context = _remote_execution_context(headers) if openai_tools else ""
 
     # A conv_header identifies one Continue chat 1:1; if a session already exists under it,
     # this is a continuation (or a retry/resubmit of an earlier turn) -- never fall through to
@@ -122,15 +164,39 @@ async def run_turn(payload: dict, headers: dict, ctx: ChatContext) -> AsyncItera
     # (still mid read/edit-tool-loop in the background) and restart the task from scratch,
     # causing the same read+edit to repeat forever.
     existing = ctx.registry.get(conv_header) if conv_header else None
+    if existing is not None and (existing.tools_signature != tools_signature(openai_tools) or existing.model != base_model):
+        log.warning("conversation configuration changed -- replacing session", extra={"conv_header": conv_header})
+        await ctx.registry.close(existing)
+        existing = None
+    elif conv_header is None:
+        log.info("no X-Conversation-Id header on this request -- relying on message-shape heuristics for continuity", extra={"is_new": is_new_conversation(messages), "n_messages": len(messages)})
+        if is_new_conversation(messages) and ctx.registry.has_active(tools_signature(openai_tools)):
+            duplicate = ctx.registry.find_active_request(messages, tools_signature(openai_tools))
+            if duplicate is not None:
+                yield DoneEvent(finish_reason="stop")
+                return
+            raise conversation_busy("A tool-enabled conversation is already active; retry with its tool results")
+    if unmatched_tool_results:
+        if existing is not None:
+            await ctx.registry.close(existing)
+        session = await _create_session(ctx, base_model, sdk_mode, openai_tools, conv_header, remote_context)
+        replay = _render_prior_transcript(budget_messages_for_replay(messages, CONFIG.replay_max_chars))
+        text = remote_context + system_prefix + replay + "\nContinue from the completed client-side tool results without repeating them."
+        async for ev in _send_and_stream(session, ctx.registry, text, messages, sdk_mode):
+            yield ev
+        return
     if existing is not None and existing.tools_signature == tools_signature(openai_tools):
-        text = (system_prefix + _last_message_text(messages)) if is_new_conversation(messages) else _last_message_text(messages)
+        if remote_context:
+            existing.remote_context = remote_context
+        prefix = existing.remote_context
+        text = prefix + ((system_prefix + _last_message_text(messages)) if is_new_conversation(messages) else _last_message_text(messages))
         async for ev in _send_and_stream(existing, ctx.registry, text, messages, sdk_mode):
             yield ev
         return
 
     if is_new_conversation(messages):
-        session = await _create_session(ctx, base_model, sdk_mode, openai_tools, conv_header)
-        text = system_prefix + _last_message_text(messages)
+        session = await _create_session(ctx, base_model, sdk_mode, openai_tools, conv_header, remote_context)
+        text = remote_context + system_prefix + _last_message_text(messages)
         async for ev in _send_and_stream(session, ctx.registry, text, messages, sdk_mode):
             yield ev
         return
@@ -138,44 +204,57 @@ async def run_turn(payload: dict, headers: dict, ctx: ChatContext) -> AsyncItera
     prior = messages[:-1]
     session = ctx.registry.find_by_prior_transcript(prior)
     if session is not None and session.tools_signature == tools_signature(openai_tools):
-        text = _last_message_text(messages)
+        if remote_context:
+            session.remote_context = remote_context
+        text = session.remote_context + _last_message_text(messages)
         async for ev in _send_and_stream(session, ctx.registry, text, messages, sdk_mode):
             yield ev
         return
 
-    session = await _create_session(ctx, base_model, sdk_mode, openai_tools, conv_header)
+    session = await _create_session(ctx, base_model, sdk_mode, openai_tools, conv_header, remote_context)
     seed = _render_prior_transcript(budget_messages_for_replay(prior, CONFIG.replay_max_chars))
-    text = system_prefix + seed + _last_message_text(messages)
+    text = remote_context + system_prefix + seed + _last_message_text(messages)
     async for ev in _send_and_stream(session, ctx.registry, text, messages, sdk_mode):
         yield ev
 
 
-async def _create_session(ctx: ChatContext, model: str, sdk_mode: str, openai_tools: list[dict] | None, conversation_id: str | None) -> RunSession:
+async def _create_session(ctx: ChatContext, model: str, sdk_mode: str, openai_tools: list[dict] | None, conversation_id: str | None, remote_context: str = "") -> RunSession:
     session_ref: dict[str, RunSession] = {}
-    custom_tools = build_custom_tools(openai_tools, session_ref, ctx.registry)
+    custom_tools = build_custom_tools(openai_tools, session_ref, ctx.registry, read_only=sdk_mode in ("ask", "plan"))
     session = await ctx.registry.create(
         model=model,
         sdk_mode=to_sdk_mode(sdk_mode),
         custom_tools=custom_tools,
         conversation_id=conversation_id,
         tools_signature=tools_signature(openai_tools),
+        remote_context=remote_context,
     )
     session_ref["session"] = session
     return session
 
 
 async def _send_and_stream(session: RunSession, registry: SessionRegistry, text: str, full_messages: list[dict], sdk_mode: str) -> AsyncIterator[Event]:
-    if session.turn_lock.locked():
+    request_hash = transcript_hash(full_messages)
+    if session.turn_lock.locked() or session.run_active or session.pending:
+        if session.active_request_hash == request_hash:
+            yield DoneEvent(finish_reason="stop")
+            return
         raise conversation_busy()
     async with session.turn_lock:
         session.touch()
         session.run_active = True
+        session.bridge_reply_sent = False
+        session.active_request_hash = request_hash
         from .session import OutputSink
 
         session.sink = OutputSink()
+        if sdk_mode == "plan":
+            text = "Read-only plan mode. Inspect only with the provided read tools. Do not modify files or run commands. Return an implementation plan.\n\n" + text
+        if "bridge_reply" in session.custom_tools:
+            text = "Call bridge_reply exactly once with your complete final answer, then end the turn.\n\n" + text
 
         async def on_delta(update) -> None:
-            if isinstance(update, TextDeltaUpdate):
+            if isinstance(update, TextDeltaUpdate) and "bridge_reply" not in session.custom_tools:
                 await session.emit(TextEvent(update.text))
             elif isinstance(update, ThinkingDeltaUpdate):
                 await session.emit(ReasoningEvent(update.text))
@@ -192,12 +271,12 @@ async def _send_and_stream(session: RunSession, registry: SessionRegistry, text:
             try:
                 result = await run.wait()
                 finish = _map_finish_reason(result.status)
-                if finish == "error":
-                    log.error("run finished with error status", extra={"status": result.status, "detail": result.result})
+                if finish == "error" and not session.bridge_reply_sent:
+                    log.error("run finished with error status %s: %s", result.status, result.result)
                     await session.emit(DoneEvent(finish_reason="error", error=result.result or f"run ended with status {result.status}"))
                 else:
                     await session.emit(UsageEvent(usage_to_openai(result.usage)))
-                    await session.emit(DoneEvent(finish_reason=finish))
+                    await session.emit(DoneEvent(finish_reason="stop" if session.bridge_reply_sent else finish))
             except Exception as e:  # noqa: BLE001
                 log.error("run failed", exc_info=True)
                 await session.emit(DoneEvent(finish_reason="error", error=f"{type(e).__name__}: {e}"))
@@ -221,7 +300,8 @@ async def _send_and_stream(session: RunSession, registry: SessionRegistry, text:
 
 async def _attach_and_stream(session: RunSession, registry: SessionRegistry, full_messages: list[dict], already_running: bool) -> AsyncIterator[Event]:
     if session.turn_lock.locked():
-        raise conversation_busy()
+        yield DoneEvent(finish_reason="stop")
+        return
     async with session.turn_lock:
         session.touch()
         task = session.run_task
@@ -280,6 +360,7 @@ async def _consume(session: RunSession, registry: SessionRegistry, full_messages
             return
         elif isinstance(item, ErrorEvent):
             yield item
+            return
 
 
 def _map_finish_reason(status: str) -> str:

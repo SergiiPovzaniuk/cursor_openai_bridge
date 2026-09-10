@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections import deque
 
@@ -12,13 +13,15 @@ from .config import CONFIG
 from .errors import OpenAIError
 from .logging_setup import get_logger
 from .metrics import METRICS
-from .security import check_relay_token
+from .security import check_allowlist, check_rate_limit, check_relay_token
 
 log = get_logger(__name__)
 
 POLL_TIMEOUT_S = 25
 BATCH_WINDOW_S = 0.04
 REPLAY_BUFFER_SIZE = 500
+OUTBOUND_QUEUE_SIZE = 2048
+CONNECTION_TTL_S = 120
 
 
 class StreamState:
@@ -32,7 +35,21 @@ class RelayConnection:
     def __init__(self, ctx: ChatContext) -> None:
         self.ctx = ctx
         self.streams: dict[str, StreamState] = {}
-        self.outq: asyncio.Queue[dict] = asyncio.Queue()
+        self.outq: asyncio.Queue[dict] = asyncio.Queue(maxsize=OUTBOUND_QUEUE_SIZE)
+        self.last_active = time.monotonic()
+
+    def touch(self) -> None:
+        self.last_active = time.monotonic()
+
+    async def close(self) -> None:
+        for state in self.streams.values():
+            if state.task and not state.task.done():
+                state.task.cancel()
+        await asyncio.gather(
+            *(state.task for state in self.streams.values() if state.task),
+            return_exceptions=True,
+        )
+        self.streams.clear()
 
     async def _send(self, frame: dict) -> None:
         await self.outq.put(frame)
@@ -46,6 +63,10 @@ class RelayConnection:
 
     async def handle_send(self, sid: str, payload: dict, headers: dict) -> None:
         state = self.streams.setdefault(sid, StreamState())
+        if state.task and not state.task.done():
+            state.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await state.task
         METRICS.active_streams += 1
         METRICS.requests_total += 1
         started = time.monotonic()
@@ -121,7 +142,7 @@ _connections: dict[str, RelayConnection] = {}
 
 
 def _conn_key(request: Request) -> str:
-    token = request.query_params.get("token") or ""
+    token = request.headers.get("x-relay-token") or request.query_params.get("token") or ""
     conn = request.query_params.get("conn") or "default"
     return f"{token}:{conn}"
 
@@ -131,26 +152,46 @@ def _conn_for(ctx: ChatContext, key: str) -> RelayConnection:
     if conn is None:
         conn = RelayConnection(ctx)
         _connections[key] = conn
+        conn.outq.put_nowait({"k": "hello"})
     return conn
 
 
+async def _prune_connections(current_key: str) -> None:
+    cutoff = time.monotonic() - CONNECTION_TTL_S
+    stale = [(key, conn) for key, conn in _connections.items() if key != current_key and conn.last_active < cutoff]
+    for key, conn in stale:
+        _connections.pop(key, None)
+        await conn.close()
+
+
 async def relay_send(request: Request, ctx: ChatContext) -> JSONResponse:
-    token = request.query_params.get("token")
+    token = request.headers.get("x-relay-token") or request.query_params.get("token")
     if not check_relay_token(token):
         return JSONResponse(status_code=401, content={"error": "bad token"})
+    check_allowlist(request)
+    check_rate_limit(request)
     try:
         frame = await request.json()
     except Exception:
         return JSONResponse(status_code=400, content={"error": "bad json"})
-    await _conn_for(ctx, _conn_key(request)).handle_frame(frame)
+    key = _conn_key(request)
+    await _prune_connections(key)
+    conn = _conn_for(ctx, key)
+    conn.touch()
+    await conn.handle_frame(frame)
     return JSONResponse({"ok": True})
 
 
 async def relay_poll(request: Request, ctx: ChatContext) -> JSONResponse:
-    token = request.query_params.get("token")
+    token = request.headers.get("x-relay-token") or request.query_params.get("token")
     if not check_relay_token(token):
         return JSONResponse(status_code=401, content={"error": "bad token"})
-    conn = _conn_for(ctx, _conn_key(request))
+    check_allowlist(request)
+    check_rate_limit(request)
+    key = _conn_key(request)
+    await _prune_connections(key)
+    conn = _conn_for(ctx, key)
+    conn.touch()
     frames: list[dict] = []
     try:
         frames.append(await asyncio.wait_for(conn.outq.get(), timeout=POLL_TIMEOUT_S))
